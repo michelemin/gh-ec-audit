@@ -116,7 +116,7 @@ impl Repository {
     }
 }
 
-#[derive(serde::Deserialize, Hash, Eq, PartialEq)]
+#[derive(serde::Deserialize, Hash, Eq, PartialEq, Clone)]
 pub struct Team {
     pub name: String,
     pub slug: String,
