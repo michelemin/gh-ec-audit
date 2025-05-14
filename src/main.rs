@@ -5,6 +5,7 @@ use gh_ec_audit::deploy_key;
 use gh_ec_audit::external_collaborator;
 
 use clap::{command, Parser};
+use gh_ec_audit::alerts;
 use gh_ec_audit::codeowners;
 use gh_ec_audit::members;
 use gh_ec_audit::repos;
@@ -113,6 +114,10 @@ struct Args {
     /// Produce a zip archive with the result (only for specific audits)
     #[arg(long)]
     zip: Option<String>,
+
+    /// Report on identified alerts (Dependabot and Code Scanning) in repos
+    #[arg(long)]
+    alerts: bool,
 }
 
 fn main() {
@@ -181,6 +186,8 @@ fn main() {
         } else {
             println!("Please specify a list of repos with --repos");
         }
+    } else if args.alerts {
+        alerts::run_alerts_audit(bootstrap, args.repos, args.csv);
     } else {
         println!("No command specified");
     }
