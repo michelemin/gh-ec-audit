@@ -4,11 +4,12 @@ use colored::Colorize;
 
 use crate::{
     get_repo_teams, make_paginated_github_request, make_paginated_github_request_with_index,
-    Bootstrap, Collaborator, Member, Team,
+    Bootstrap, Collaborator, Member, ProgressTracker, Team,
 };
 
 pub fn get_org_members(bootstrap: &Bootstrap) -> HashSet<Member> {
     match make_paginated_github_request(
+        &bootstrap.client,
         &bootstrap.token,
         100,
         &format!("/orgs/{}/members", &bootstrap.org),
@@ -24,6 +25,7 @@ pub fn get_org_members(bootstrap: &Bootstrap) -> HashSet<Member> {
 
 pub fn get_indexed_org_members(bootstrap: &Bootstrap) -> HashMap<String, Member> {
     match make_paginated_github_request_with_index(
+        &bootstrap.client,
         &bootstrap.token,
         100,
         &format!("/orgs/{}/members", &bootstrap.org),
@@ -40,6 +42,7 @@ pub fn get_indexed_org_members(bootstrap: &Bootstrap) -> HashMap<String, Member>
 pub fn get_org_admins(bootstrap: &Bootstrap) -> HashMap<String, Member> {
     let organization_admins: HashMap<String, Member> =
         match make_paginated_github_request_with_index(
+            &bootstrap.client,
             &bootstrap.token,
             100,
             &format!("/orgs/{}/members", &bootstrap.org),
@@ -63,19 +66,11 @@ pub fn run_audit(bootstrap: Bootstrap) {
 pub fn run_admin_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>) {
     let organization_admins = get_org_admins(&bootstrap);
 
-    let repositories = repos.unwrap_or_else(|| {
-        bootstrap
-            .fetch_all_repositories(75)
-            .unwrap()
-            .into_iter()
-            .map(|r| r.name)
-            .collect::<Vec<String>>()
-    });
+    let repositories = bootstrap.resolve_repos(repos);
 
     let mut team_cache: HashMap<String, HashMap<String, Member>> = HashMap::new();
 
-    let one_percent = (repositories.len() as f64 * 0.01).ceil() as usize;
-    let mut progress = 0;
+    let mut tracker = ProgressTracker::new(repositories.len());
 
     for repository in repositories {
         // Get the teams that have access to the repository
@@ -125,6 +120,7 @@ pub fn run_admin_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>) {
         }
 
         let collaborators: HashSet<Collaborator> = match make_paginated_github_request(
+            &bootstrap.client,
             &bootstrap.token,
             25,
             &format!("/repos/{}/{}/collaborators", &bootstrap.org, repository),
@@ -162,9 +158,6 @@ pub fn run_admin_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>) {
                 );
             }
         }
-        progress += 1;
-        if progress % one_percent == 0 {
-            println!("Processed {} reposistories", progress.to_string().blue());
-        }
+        tracker.tick();
     }
 }

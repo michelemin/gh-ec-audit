@@ -4,7 +4,7 @@ use gh_ec_audit::compliance;
 use gh_ec_audit::deploy_key;
 use gh_ec_audit::external_collaborator;
 
-use clap::{command, Parser};
+use clap::Parser;
 use gh_ec_audit::alerts;
 use gh_ec_audit::codeowners;
 use gh_ec_audit::members;
