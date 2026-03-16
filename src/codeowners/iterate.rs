@@ -14,7 +14,7 @@ pub fn get_co_file(bootstrap: &Bootstrap, repo: &str) -> Result<Option<Codeowner
     for location in CO_LOCATIONS {
         // Try to download the file and fill in `content` and `html_url`
         let url = format!("/repos/{}/{}/contents/{}", bootstrap.org, repo, location);
-        let res = make_github_request(&bootstrap.token, &url, 3, None);
+        let res = make_github_request(&bootstrap.client, &bootstrap.token, &url, 3, None);
         match res {
             Err(_) => continue, // The call for this location failed, keep going
             Ok(v) => {
@@ -36,7 +36,7 @@ pub fn get_co_file(bootstrap: &Bootstrap, repo: &str) -> Result<Option<Codeowner
                 let html_url = v
                     .get("html_url")
                     .and_then(|u| u.as_str())
-                    .and_then(|s| Some(s.to_string()))
+                    .map(|s| s.to_string())
                     .unwrap_or("Not available".to_string());
                 if let Ok(content) = process_fetch_file_result(v) {
                     return Ok(Some(CodeownersFile::parse_from_content(
@@ -65,7 +65,7 @@ pub fn find_codeowners_in_org(
             .fetch_all_repositories(75)?
             .into_iter()
             .map(|r| r.name)
-            .collect::<Vec<String>>(),
+            .collect(),
     };
 
     let mut all_results = vec![];

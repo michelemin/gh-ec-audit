@@ -1,25 +1,17 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
-    fs::File,
-    io::{BufWriter, Write},
-    path::Path,
+    io::Write,
 };
 
 use colored::Colorize;
 
-use crate::{email_from_gh_username, Bootstrap, Permissions, Team};
+use crate::{create_csv_writer, email_from_gh_username, Bootstrap, Permissions, Team};
 
 /// Write to a CSV file the information we collected during a repo audit
 pub(crate) fn repo_audit_to_csv(csv_file: impl Display, lines: &[String]) {
-    // Create file and all intermediate folders if necessary
     let csv_file = csv_file.to_string();
-    let path = Path::new(&csv_file);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect(&"Could not create folders".red());
-    }
-    let file = File::create(path).expect(&"Could not create CSV file".red());
-    let mut writer = BufWriter::new(file);
+    let mut writer = create_csv_writer(&csv_file);
 
     let mut count_entries = 0;
 
@@ -27,6 +19,8 @@ pub(crate) fn repo_audit_to_csv(csv_file: impl Display, lines: &[String]) {
         writeln!(writer, "{line}").expect(&"Could not write to CSV file".red());
         count_entries += 1;
     }
+
+    count_entries -= 1; // Remove header from count
 
     println!(
         "{} {}: {} {} {}",
@@ -43,14 +37,8 @@ pub(crate) fn team_access_to_csv(
     csv_file: impl Display,
     teams_to_repos: &HashMap<String, HashSet<(String, Option<Permissions>)>>,
 ) {
-    // Create file and all intermediate folders if necessary
     let csv_file = csv_file.to_string();
-    let path = Path::new(&csv_file);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect(&"Could not create folders".red());
-    }
-    let file = File::create(path).expect(&"Could not create CSV file".red());
-    let mut writer = BufWriter::new(file);
+    let mut writer = create_csv_writer(&csv_file);
 
     // Write headers
     writeln!(writer, "team,repo,permissions").expect(&"Could not write to CSV file".red());
@@ -87,14 +75,8 @@ pub(crate) fn team_members_to_csv(
     csv_file: impl Display,
     teams_to_repos: &HashMap<String, HashSet<(String, Option<Permissions>)>>,
 ) {
-    // Create file and all intermediate folders if necessary
     let csv_file = csv_file.to_string();
-    let path = Path::new(&csv_file);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect(&"Could not create folders".red());
-    }
-    let file = File::create(path).expect(&"Could not create CSV file".red());
-    let mut writer = BufWriter::new(file);
+    let mut writer = create_csv_writer(&csv_file);
 
     // Write headers
     writeln!(writer, "team,user,email").expect(&"Could not write to CSV file".red());

@@ -1,14 +1,9 @@
-use std::{
-    collections::HashSet,
-    fs::File,
-    io::{BufWriter, Write},
-    path::Path,
-};
+use std::{collections::HashSet, io::Write};
 
 use colored::Colorize;
 use serde::Deserialize;
 
-use crate::{get_repo_visibility, make_paginated_github_request, Bootstrap};
+use crate::{create_csv_writer, get_repo_visibility, make_paginated_github_request, Bootstrap};
 
 /// The severity of a security alert
 #[derive(Debug, Deserialize, Eq, PartialEq, Hash)]
@@ -165,14 +160,7 @@ fn number_or_na(num: i32) -> String {
 /// Run the audit on the security alerts for the given repos (or all org repos if none are passed).
 /// Optionally, produce a CSV file with the results.
 pub fn run_alerts_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>, csv: bool) {
-    let repos = repos.unwrap_or_else(|| {
-        bootstrap
-            .fetch_all_repositories(75)
-            .unwrap()
-            .into_iter()
-            .map(|r| r.name)
-            .collect::<Vec<String>>()
-    });
+    let repos = bootstrap.resolve_repos(repos);
 
     let repo_alerts = repos
         .iter()
@@ -186,14 +174,8 @@ pub fn run_alerts_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>, csv: b
     // Print or write to file all the results
 
     if csv {
-        // Create file and all intermediate folders if necessary
-        let csv_file = "output/alerts.csv".to_string();
-        let path = Path::new(&csv_file);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).expect(&"Could not create folders".red());
-        }
-        let file = File::create(path).expect(&"Could not create CSV file".red());
-        let mut writer = BufWriter::new(file);
+        let csv_file = "output/alerts.csv";
+        let mut writer = create_csv_writer(csv_file);
 
         // Write headers
         writeln!(writer, "repository, visibility, dependabot alerts, low, medium, high, critical, code scanning alerts, low, medium, high, critical").expect(&"Could not write to CSV file".red());
@@ -251,6 +233,7 @@ fn fetch_dependabot_alerts(
     repo: &str,
 ) -> Result<HashSet<DependabotAlert>, String> {
     make_paginated_github_request(
+        &bootstrap.client,
         &bootstrap.token,
         30,
         &format!("/repos/{}/{repo}/dependabot/alerts", bootstrap.org),
@@ -265,6 +248,7 @@ fn fetch_codescanning_alerts(
     repo: &str,
 ) -> Result<HashSet<CodeScanningAlert>, String> {
     make_paginated_github_request(
+        &bootstrap.client,
         &bootstrap.token,
         30,
         &format!("/repos/{}/{repo}/code-scanning/alerts", bootstrap.org),

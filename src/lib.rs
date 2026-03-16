@@ -1,6 +1,9 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
+    fs::File,
+    io::BufWriter,
+    path::Path,
     thread::sleep,
     time::Duration,
 };
@@ -20,6 +23,7 @@ pub mod uar;
 pub mod utils;
 
 const GRAPHQL_URL: &str = "https://api.github.com/graphql";
+const API_BASE: &str = "https://api.github.com";
 
 pub trait GitHubIndex {
     fn index(&self) -> String;
@@ -134,6 +138,7 @@ impl Team {
         // NOTE - We don't make a paginated request on purpose: we only want
         // to see if a team is empty or not, and we don't need to fetch _all_ members.
         let members = make_github_request(
+            &bootstrap.client,
             &bootstrap.token,
             &format!("/orgs/{}/teams/{}/members", bootstrap.org, self.slug),
             3,
@@ -149,6 +154,7 @@ impl Team {
     /// Fetch members of this team, including members of child teams
     fn fetch_team_members(&self, bootstrap: &Bootstrap) -> Result<HashMap<String, Member>, String> {
         make_paginated_github_request_with_index(
+            &bootstrap.client,
             &bootstrap.token,
             25,
             &format!("/orgs/{}/teams/{}/members", &bootstrap.org, self.slug),
@@ -165,7 +171,34 @@ enum GitHubResponse<T> {
     Error(GitHubError),
 }
 
+/// Execute an HTTP request with retry logic. The `request_fn` closure builds
+/// and sends the request; this helper handles transient failures and retries.
+fn execute_with_retries<F>(retries: u8, mut request_fn: F) -> Result<String, String>
+where
+    F: FnMut() -> Result<String, reqwest::Error>,
+{
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        match request_fn() {
+            Ok(content) => return Ok(content),
+            Err(e) => {
+                if tries >= retries {
+                    println!("{}", "Retries exhausted".red());
+                    return Err(e.to_string());
+                }
+                println!(
+                    "{}: {}",
+                    "Going to retry because of a GitHub request error:".yellow(),
+                    e.to_string().red()
+                );
+            }
+        }
+    }
+}
+
 fn make_github_request(
+    client: &reqwest::blocking::Client,
     gh_token: &str,
     url: &str,
     retries: u8,
@@ -176,60 +209,24 @@ fn make_github_request(
         None => String::new(),
     };
 
-    let mut tries = 0;
-    loop {
-        tries += 1;
-        let response = reqwest::blocking::Client::new()
-            .get(&format!("https://api.github.com{url}{params}",))
+    let full_url = format!("{API_BASE}{url}{params}");
+    let content = execute_with_retries(retries, || {
+        client
+            .get(&full_url)
             .header("User-Agent", "GitHub EC Audit")
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .header("Authorization", format!("Bearer {}", gh_token))
             .send()
-            .map(|response| response.text());
+            .and_then(|response| response.text())
+    })?;
 
-        // Handle communication issues with GitHub
-        let content = match response {
-            Ok(Ok(content)) => content,
-            Ok(Err(e)) => {
-                if tries >= retries {
-                    println!("{}", "Retries exhausted".red());
-                    return Err(e.to_string());
-                }
-
-                println!(
-                    "{}: {}",
-                    "Going to retry because couldn't read response from GitHub:".yellow(),
-                    e.to_string().red()
-                );
-
-                continue;
-            }
-            Err(e) => {
-                if tries >= retries {
-                    println!("{}", "Retries exhausted".red());
-                    return Err(e.to_string());
-                }
-
-                println!(
-                    "{}: {}",
-                    "Going to retry because couldn't make request to GitHub:".yellow(),
-                    e.to_string().red()
-                );
-
-                continue;
-            }
-        };
-
-        let value = serde_json::from_str::<serde_json::Value>(&content)
-            .map_err(|e| format!("Could not deserialize GitHub's response. Error: {e}"))?;
-
-        // break the loop and return the value we got
-        return Ok(value);
-    }
+    serde_json::from_str::<serde_json::Value>(&content)
+        .map_err(|e| format!("Could not deserialize GitHub's response. Error: {e}"))
 }
 
 fn make_paginated_github_request<T>(
+    client: &reqwest::blocking::Client,
     gh_token: &str,
     page_size: u8,
     url: &str,
@@ -246,51 +243,23 @@ where
 
     let mut page = 1;
     let mut all_items = HashSet::new();
-    let mut tries = 0;
+    let mut tries: u8 = 0;
     loop {
         tries += 1;
-        let response = reqwest::blocking::Client::new()
-            .get(&format!(
-                "https://api.github.com{url}?per_page={page_size}&page={page}{params}",
-            ))
-            .header("User-Agent", "GitHub EC Audit")
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .header("Authorization", format!("Bearer {}", gh_token))
-            .send()
-            .map(|response| response.text());
+        let full_url = format!("{API_BASE}{url}?per_page={page_size}&page={page}{params}");
 
-        // Handle communication issues with GitHub
-        let content = match response {
-            Ok(Ok(content)) => content,
-            Ok(Err(e)) => {
-                if tries >= retries {
-                    println!("{}", "Retries exhausted".red());
-                    return Err(e.to_string());
-                }
-
-                println!(
-                    "{}: {}",
-                    "Going to retry because couldn't read response from GitHub:".yellow(),
-                    e.to_string().red()
-                );
-
-                continue;
-            }
-            Err(e) => {
-                if tries >= retries {
-                    println!("{}", "Retries exhausted".red());
-                    return Err(e.to_string());
-                }
-
-                println!(
-                    "{}: {}",
-                    "Going to retry because couldn't make request to GitHub:".yellow(),
-                    e.to_string().red()
-                );
-
-                continue;
-            }
+        let content = match execute_with_retries(retries, || {
+            client
+                .get(&full_url)
+                .header("User-Agent", "GitHub EC Audit")
+                .header("Accept", "application/vnd.github+json")
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("Authorization", format!("Bearer {}", gh_token))
+                .send()
+                .and_then(|response| response.text())
+        }) {
+            Ok(content) => content,
+            Err(e) => return Err(e),
         };
 
         // Handle GitHub errors
@@ -352,6 +321,7 @@ where
 }
 
 fn make_paginated_github_request_with_index<T>(
+    client: &reqwest::blocking::Client,
     gh_token: &str,
     page_size: u8,
     url: &str,
@@ -362,7 +332,7 @@ where
     T: serde::de::DeserializeOwned + std::hash::Hash + std::cmp::Eq + GitHubIndex,
 {
     let results: HashSet<T> =
-        make_paginated_github_request(gh_token, page_size, url, retries, params)?;
+        make_paginated_github_request(client, gh_token, page_size, url, retries, params)?;
 
     Ok(results
         .into_iter()
@@ -373,6 +343,7 @@ where
 pub struct Bootstrap {
     token: String,
     org: String,
+    client: reqwest::blocking::Client,
 }
 
 impl Bootstrap {
@@ -398,7 +369,9 @@ impl Bootstrap {
         };
         println!("{} {}", "I have organization:".green(), org.white());
 
-        Ok(Self { token, org })
+        let client = reqwest::blocking::Client::new();
+
+        Ok(Self { token, org, client })
     }
 
     pub fn fetch_all_repositories(&self, page_size: u8) -> Result<HashSet<Repository>, String> {
@@ -408,6 +381,7 @@ impl Bootstrap {
         );
 
         let repositories: HashSet<Repository> = match make_paginated_github_request(
+            &self.client,
             &self.token,
             page_size,
             &format!("/orgs/{}/repos", &self.org),
@@ -434,6 +408,17 @@ impl Bootstrap {
 
         Ok(repositories)
     }
+
+    /// Resolve an optional list of repos: if None, fetch all repos from the org.
+    pub fn resolve_repos(&self, repos: Option<Vec<String>>) -> Vec<String> {
+        repos.unwrap_or_else(|| {
+            self.fetch_all_repositories(75)
+                .unwrap()
+                .into_iter()
+                .map(|r| r.name)
+                .collect()
+        })
+    }
 }
 
 /// Get collaborators for a given repository
@@ -442,6 +427,7 @@ fn get_repo_collaborators(
     repo: &str,
 ) -> Result<HashSet<Collaborator>, String> {
     make_paginated_github_request(
+        &bootstrap.client,
         &bootstrap.token,
         25,
         &format!("/repos/{}/{}/collaborators", &bootstrap.org, repo),
@@ -453,6 +439,7 @@ fn get_repo_collaborators(
 /// Get the teams that have access to the repo
 fn get_repo_teams(bootstrap: &Bootstrap, repo: &str) -> Result<HashSet<Team>, String> {
     make_paginated_github_request(
+        &bootstrap.client,
         &bootstrap.token,
         25,
         &format!("/repos/{}/{}/teams", &bootstrap.org, repo),
@@ -464,6 +451,7 @@ fn get_repo_teams(bootstrap: &Bootstrap, repo: &str) -> Result<HashSet<Team>, St
 /// Get the visibility of a repository, given its name
 fn get_repo_visibility(bootstrap: &Bootstrap, repo: &str) -> Result<String, String> {
     let res = make_github_request(
+        &bootstrap.client,
         &bootstrap.token,
         &format!("/repos/{}/{repo}", bootstrap.org),
         3,
@@ -471,7 +459,7 @@ fn get_repo_visibility(bootstrap: &Bootstrap, repo: &str) -> Result<String, Stri
     )?;
     res.get("visibility")
         .and_then(|v| v.as_str())
-        .and_then(|v| Some(v.to_string()))
+        .map(|v| v.to_string())
         .ok_or("Missing visibility in the response from GitHub".to_string())
 }
 
@@ -483,16 +471,15 @@ pub struct GraphQLQuery {
 
 /// Make a GraphQL query on GitHub
 fn make_graphql_query(
+    client: &reqwest::blocking::Client,
     gh_token: &str,
     query: GraphQLQuery,
     retries: u8,
 ) -> Result<serde_json::Value, String> {
     let query = serde_json::to_string(&query).unwrap();
 
-    let mut tries = 0;
-    loop {
-        tries += 1;
-        let response = reqwest::blocking::Client::new()
+    let content = execute_with_retries(retries, || {
+        client
             .post(GRAPHQL_URL)
             .header("User-Agent", "GitHub EC Audit")
             .header("Accept", "application/vnd.github+json")
@@ -500,47 +487,11 @@ fn make_graphql_query(
             .header("Authorization", format!("Bearer {}", gh_token))
             .body(query.clone())
             .send()
-            .map(|response| response.text());
+            .and_then(|response| response.text())
+    })?;
 
-        // Handle communication issues with GitHub
-        let content = match response {
-            Ok(Ok(content)) => content,
-            Ok(Err(e)) => {
-                if tries >= retries {
-                    println!("{}", "Retries exhausted".red());
-                    return Err(e.to_string());
-                }
-
-                println!(
-                    "{}: {}",
-                    "Going to retry because couldn't read response from GitHub:".yellow(),
-                    e.to_string().red()
-                );
-
-                continue;
-            }
-            Err(e) => {
-                if tries >= retries {
-                    println!("{}", "Retries exhausted".red());
-                    return Err(e.to_string());
-                }
-
-                println!(
-                    "{}: {}",
-                    "Going to retry because couldn't make request to GitHub:".yellow(),
-                    e.to_string().red()
-                );
-
-                continue;
-            }
-        };
-
-        let value = serde_json::from_str::<serde_json::Value>(&content)
-            .map_err(|e| format!("Could not deserialize GitHub's response. Error: {e}"))?;
-
-        // break the loop and return the value we got
-        return Ok(value);
-    }
+    serde_json::from_str::<serde_json::Value>(&content)
+        .map_err(|e| format!("Could not deserialize GitHub's response. Error: {e}"))
 }
 
 /// Get the email address associated to a username, if available, through the configured SAML IdP.
@@ -553,7 +504,7 @@ fn email_from_gh_username(bootstrap: &Bootstrap, user: impl Display) -> Option<S
         ]
         .into(),
     };
-    make_graphql_query(&bootstrap.token, q, 3)
+    make_graphql_query(&bootstrap.client, &bootstrap.token, q, 3)
         .ok()?
         .get("data")
         .and_then(|v| v.get("organization"))
@@ -566,5 +517,40 @@ fn email_from_gh_username(bootstrap: &Bootstrap, user: impl Display) -> Option<S
         .and_then(|v| v.get("samlIdentity"))
         .and_then(|v| v.get("nameId"))
         .and_then(|v| v.as_str())
-        .and_then(|v| Some(v.to_string()))
+        .map(|v| v.to_string())
+}
+
+/// Progress tracker for repo-iteration audits
+pub struct ProgressTracker {
+    one_percent: usize,
+    progress: usize,
+}
+
+impl ProgressTracker {
+    pub fn new(total: usize) -> Self {
+        Self {
+            one_percent: (total as f64 * 0.01).ceil() as usize,
+            progress: 0,
+        }
+    }
+
+    pub fn tick(&mut self) {
+        self.progress += 1;
+        if self.progress % self.one_percent == 0 {
+            println!(
+                "Processed {} repositories",
+                self.progress.to_string().blue()
+            );
+        }
+    }
+}
+
+/// Create a BufWriter to a CSV file, creating parent directories as needed.
+pub fn create_csv_writer(csv_file: &str) -> BufWriter<File> {
+    let path = Path::new(csv_file);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect(&"Could not create folders".red());
+    }
+    let file = File::create(path).expect(&"Could not create CSV file".red());
+    BufWriter::new(file)
 }
