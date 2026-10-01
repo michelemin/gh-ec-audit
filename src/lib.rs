@@ -106,14 +106,15 @@ pub struct Repository {
     pub visibility: String,
     // We leave this as a generic Value because its contents seem to change
     // depending on some org-level settings (e.g., whether GHAS is enabled).
-    pub security_and_analysis: serde_json::Value,
+    pub security_and_analysis: Option<serde_json::Value>,
 }
 
 impl Repository {
     /// Returns whether a given security property is available and enabled.
     fn is_security_property_enabled(&self, property: &str) -> bool {
         self.security_and_analysis
-            .get(property)
+            .as_ref()
+            .and_then(|sa| sa.get(property))
             .and_then(|v| v.get("status"))
             .and_then(|st| st.as_str())
             .unwrap_or("")
