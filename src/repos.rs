@@ -43,9 +43,9 @@ fn get_repos_security_property_not_enabled(
 
 /// Run the repos audit
 pub fn run_repos_audit(bootstrap: Bootstrap) {
-    let repos = bootstrap.fetch_all_repositories(75).expect(&format!(
+    let repos = bootstrap.fetch_all_repositories(75, false).expect(&format!(
         "{}",
-        "I could not fetch the list of repositories. I am giving up.".red()
+        "I could not fetch the list of repositories. I am giving up.".red(),
     ));
 
     // Collect some numbers about the repos and the types

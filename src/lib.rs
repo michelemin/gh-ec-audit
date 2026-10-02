@@ -102,7 +102,6 @@ pub struct Repository {
     pub archived: bool,
     pub disabled: bool,
     pub permissions: Permissions,
-    pub archived: bool,
     pub visibility: String,
     // We leave this as a generic Value because its contents seem to change
     // depending on some org-level settings (e.g., whether GHAS is enabled).
@@ -447,7 +446,7 @@ impl Bootstrap {
     /// Resolve an optional list of repos: if None, fetch all repos from the org.
     pub fn resolve_repos(&self, repos: Option<Vec<String>>) -> Vec<String> {
         repos.unwrap_or_else(|| {
-            self.fetch_all_repositories(75)
+            self.fetch_all_repositories(75, false)
                 .unwrap()
                 .into_iter()
                 .map(|r| r.name)
