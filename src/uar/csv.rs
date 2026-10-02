@@ -86,6 +86,7 @@ pub(crate) fn team_members_to_csv(
     for (team, _) in teams_to_repos {
         // A temporary team object just to be able to call the fetch_members method
         let tmp_team = Team {
+            id: 0,
             slug: team.to_string(),
             name: team.to_string(),
             permissions: None,

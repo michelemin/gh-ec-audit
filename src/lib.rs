@@ -10,6 +10,7 @@ use std::{
 
 use colored::Colorize;
 
+pub mod actors;
 pub mod alerts;
 pub mod bpr;
 pub mod codeowners;
@@ -123,6 +124,7 @@ impl Repository {
 
 #[derive(serde::Deserialize, Hash, Eq, PartialEq, Clone)]
 pub struct Team {
+    pub id: i64,
     pub name: String,
     pub slug: String,
     pub permissions: Option<Permissions>,

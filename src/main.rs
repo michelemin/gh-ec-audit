@@ -140,7 +140,7 @@ fn main() {
     } else if args.admin {
         members::run_admin_audit(bootstrap, args.repos);
     } else if args.bpr {
-        bpr::run_audit(bootstrap, args.repos);
+        bpr::run_audit(bootstrap, args.repos, args.verbose);
     } else if args.teamperm {
         if let Some(team) = args.team {
             teams::run_team_repo_audit(bootstrap, team);
