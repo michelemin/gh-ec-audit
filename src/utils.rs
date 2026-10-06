@@ -1,11 +1,11 @@
-use crate::{make_github_request, Bootstrap};
+use crate::GitHubClient;
 use base64::prelude::*;
 use serde_json::Value;
 
 /// Retrieve the content of a GH file
-pub fn fetch_file_content(bootstrap: &Bootstrap, url: &str) -> Result<String, String> {
+pub fn fetch_file_content(client: &GitHubClient, url: &str) -> Result<String, String> {
     let url = url.trim_start_matches("https://api.github.com");
-    let res = make_github_request(&bootstrap.client, &bootstrap.token, url, 3, None).unwrap();
+    let res = client.get_json(url, None)?;
     process_fetch_file_result(res)
 }
 

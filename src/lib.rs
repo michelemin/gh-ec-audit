@@ -1,12 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    fmt::Display,
-    fs::File,
-    io::BufWriter,
-    path::Path,
-    thread::sleep,
-    time::Duration,
-};
+use std::{collections::HashMap, fs::File, io::BufWriter, path::Path};
 
 use colored::Colorize;
 
@@ -15,8 +7,10 @@ pub mod alerts;
 pub mod bpr;
 pub mod codeowners;
 pub mod compliance;
+pub mod constants;
 pub mod deploy_key;
 pub mod external_collaborator;
+pub mod github;
 pub mod gql_queries;
 pub mod members;
 pub mod repos;
@@ -24,9 +18,9 @@ pub mod teams;
 pub mod uar;
 pub mod utils;
 
-const GRAPHQL_URL: &str = "https://api.github.com/graphql";
-const API_BASE: &str = "https://api.github.com";
+pub use github::GitHubClient;
 
+/// A type that can be indexed by a string key (e.g. a login or a slug)
 pub trait GitHubIndex {
     fn index(&self) -> String;
 }
@@ -46,6 +40,16 @@ pub struct Collaborator {
     permissions: Permissions,
 }
 
+impl Collaborator {
+    pub fn login(&self) -> &str {
+        &self.login
+    }
+
+    pub fn permissions(&self) -> &Permissions {
+        &self.permissions
+    }
+}
+
 #[derive(Debug, serde::Deserialize, Hash, Eq, PartialEq)]
 pub struct Member {
     pub avatar_url: String,
@@ -59,7 +63,7 @@ impl GitHubIndex for Member {
 }
 
 impl Permissions {
-    fn highest_perm(&self) -> String {
+    pub fn highest_perm(&self) -> String {
         if self.admin {
             return "admin".to_string();
         }
@@ -80,23 +84,6 @@ impl Permissions {
 }
 
 #[derive(Debug, serde::Deserialize, Hash, Eq, PartialEq)]
-struct GitHubError {
-    pub message: String,
-    pub documentation_url: String,
-    pub status: String,
-}
-
-impl Display for GitHubError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "GitHubError: {} {} {}",
-            self.message, self.documentation_url, self.status
-        )
-    }
-}
-
-#[derive(Debug, serde::Deserialize, Hash, Eq, PartialEq)]
 pub struct Repository {
     pub name: String,
     pub private: bool,
@@ -111,7 +98,7 @@ pub struct Repository {
 
 impl Repository {
     /// Returns whether a given security property is available and enabled.
-    fn is_security_property_enabled(&self, property: &str) -> bool {
+    pub fn is_security_property_enabled(&self, property: &str) -> bool {
         self.security_and_analysis
             .as_ref()
             .and_then(|sa| sa.get(property))
@@ -139,14 +126,11 @@ impl GitHubIndex for Team {
 impl Team {
     /// Return whether a team is empty, i.e., if the team has no members,
     /// including its sub-teams.
-    fn is_empty(&self, bootstrap: &Bootstrap) -> Result<bool, String> {
+    pub fn is_empty(&self, client: &GitHubClient) -> Result<bool, String> {
         // NOTE - We don't make a paginated request on purpose: we only want
         // to see if a team is empty or not, and we don't need to fetch _all_ members.
-        let members = make_github_request(
-            &bootstrap.client,
-            &bootstrap.token,
-            &format!("/orgs/{}/teams/{}/members", bootstrap.org, self.slug),
-            3,
+        let members = client.get_json(
+            &format!("/orgs/{}/teams/{}/members", client.org(), self.slug),
             None,
         )?;
 
@@ -155,405 +139,21 @@ impl Team {
             None => Err("The value returned by GitHub is not an array".to_string()),
         }
     }
-
-    /// Fetch members of this team, including members of child teams
-    fn fetch_team_members(&self, bootstrap: &Bootstrap) -> Result<HashMap<String, Member>, String> {
-        make_paginated_github_request_with_index(
-            &bootstrap.client,
-            &bootstrap.token,
-            25,
-            &format!("/orgs/{}/teams/{}/members", &bootstrap.org, self.slug),
-            3,
-            None,
-        )
-    }
 }
 
-#[derive(Debug, serde::Deserialize, Hash, Eq, PartialEq)]
-#[serde(untagged)]
-enum GitHubResponse<T> {
-    Data(Vec<T>),
-    Error(GitHubError),
-}
-
-/// Execute an HTTP request with retry logic. The `request_fn` closure builds
-/// and sends the request; this helper handles transient failures and retries.
-fn execute_with_retries<F>(retries: u8, mut request_fn: F) -> Result<String, String>
-where
-    F: FnMut() -> Result<String, reqwest::Error>,
-{
-    let mut tries = 0;
-    loop {
-        tries += 1;
-        match request_fn() {
-            Ok(content) => return Ok(content),
-            Err(e) => {
-                if tries >= retries {
-                    println!("{}", "Retries exhausted".red());
-                    return Err(e.to_string());
-                }
-                println!(
-                    "{}: {}",
-                    "Going to retry because of a GitHub request error:".yellow(),
-                    e.to_string().red()
-                );
-            }
-        }
-    }
-}
-
-fn make_github_request(
-    client: &reqwest::blocking::Client,
-    gh_token: &str,
-    url: &str,
-    retries: u8,
-    params: Option<&str>,
-) -> Result<serde_json::Value, String> {
-    let params = match params {
-        Some(params) => format!("?{params}"),
-        None => String::new(),
-    };
-
-    let full_url = format!("{API_BASE}{url}{params}");
-    let content = execute_with_retries(retries, || {
-        client
-            .get(&full_url)
-            .header("User-Agent", "GitHub EC Audit")
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .header("Authorization", format!("Bearer {}", gh_token))
-            .send()
-            .and_then(|response| response.text())
-    })?;
-
-    serde_json::from_str::<serde_json::Value>(&content)
-        .map_err(|e| format!("Could not deserialize GitHub's response. Error: {e}"))
-}
-
-fn make_paginated_github_request<T>(
-    client: &reqwest::blocking::Client,
-    gh_token: &str,
-    page_size: u8,
-    url: &str,
-    retries: u8,
-    params: Option<&str>,
-) -> Result<HashSet<T>, String>
-where
-    T: serde::de::DeserializeOwned + std::hash::Hash + std::cmp::Eq,
-{
-    let params = match params {
-        Some(params) => format!("&{params}"),
-        None => String::new(),
-    };
-
-    let mut page = 1;
-    let mut all_items = HashSet::new();
-    let mut tries: u8 = 0;
-    loop {
-        tries += 1;
-        let full_url = format!("{API_BASE}{url}?per_page={page_size}&page={page}{params}");
-
-        let content = match execute_with_retries(retries, || {
-            client
-                .get(&full_url)
-                .header("User-Agent", "GitHub EC Audit")
-                .header("Accept", "application/vnd.github+json")
-                .header("X-GitHub-Api-Version", "2022-11-28")
-                .header("Authorization", format!("Bearer {}", gh_token))
-                .send()
-                .and_then(|response| response.text())
-        }) {
-            Ok(content) => content,
-            Err(e) => return Err(e),
-        };
-
-        // Handle GitHub errors
-        match serde_json::from_str::<GitHubResponse<T>>(content.as_str()) {
-            Ok(GitHubResponse::Data(data)) => {
-                // When we go past the end (an unneeded page), we'll get an empty response so we can break
-                if data.is_empty() {
-                    break;
-                }
-
-                // The page is full so we need to add all these users to our set and grab the next page
-                page += 1;
-                tries = 0;
-                all_items.extend(data);
-            }
-            Ok(GitHubResponse::Error(e)) => {
-                // GitHub threw an error and if it's a ratelimit we can wait and retry
-                if e.message.contains("API rate limit exceeded") {
-                    sleep(Duration::from_secs(60));
-                } else {
-                    // This doesn't look like the expected data or a ratelimit error
-
-                    // We're out of retries so we need to stop
-                    if tries >= retries {
-                        println!("{}", "Retries exhausted".red());
-                        return Err(e.to_string());
-                    }
-
-                    // We have retries remaining so we'll try again
-                    println!(
-                        "{}: {}",
-                        "Going to retry because couldn't deserialize response from GitHub:"
-                            .yellow(),
-                        e.to_string().red()
-                    );
-                    tries += 1;
-                    println!("{}", content.yellow());
-                }
-            }
-            Err(e) => {
-                // This doesn't look like the expected data or an error
-                if tries >= retries {
-                    println!("{}", "Retries exhausted".red());
-                    return Err(e.to_string());
-                }
-
-                println!(
-                    "{}: {}",
-                    "Going to retry because couldn't deserialize response from GitHub:".yellow(),
-                    e.to_string().red()
-                );
-
-                println!("{}", content.yellow());
-            }
-        }
-    }
-
-    Ok(all_items)
-}
-
-fn make_paginated_github_request_with_index<T>(
-    client: &reqwest::blocking::Client,
-    gh_token: &str,
-    page_size: u8,
-    url: &str,
-    retries: u8,
-    params: Option<&str>,
-) -> Result<HashMap<String, T>, String>
-where
-    T: serde::de::DeserializeOwned + std::hash::Hash + std::cmp::Eq + GitHubIndex,
-{
-    let results: HashSet<T> =
-        make_paginated_github_request(client, gh_token, page_size, url, retries, params)?;
-
-    Ok(results
-        .into_iter()
-        .map(|item| (item.index(), item))
-        .collect::<HashMap<String, T>>())
-}
-
-pub struct Bootstrap {
-    token: String,
-    org: String,
-    client: reqwest::blocking::Client,
-}
-
-impl Bootstrap {
-    pub fn new() -> Result<Self, String> {
-        println!(
-            "{}",
-            "I'm checking there is a GitHub FPAT in the GH_TOKEN environment variable...".yellow()
-        );
-
-        let token = match std::env::var("GH_TOKEN") {
-            Ok(token) => token,
-            Err(_) => {
-                return Err("GH_TOKEN not found".to_string());
-            }
-        };
-        println!("{} {}...", "I have token:".green(), &token[..20]);
-
-        let org = match std::env::var("GH_ORG") {
-            Ok(org) => org,
-            Err(_) => {
-                return Err("GH_ORG not found".to_string());
-            }
-        };
-        println!("{} {}", "I have organization:".green(), org.white());
-
-        let client = reqwest::blocking::Client::new();
-
-        Ok(Self { token, org, client })
-    }
-
-    /// Fetch all repositories in an org.
-    /// Args:
-    /// * `page_size` - The size of each page when making requests to the GH API
-    /// * `active_only` - Consider only active repositories (non-archived and not disabled)
-    pub fn fetch_all_repositories(
-        &self,
-        page_size: u8,
-        active_only: bool,
-    ) -> Result<HashSet<Repository>, String> {
-        if active_only {
-            println!(
-                "{}",
-                "I'm going to fetch all active repositories from the org".yellow()
-            );
-        } else {
-            println!(
-                "{}",
-                "I'm going to fetch all repositories from the org".yellow()
-            );
-        }
-
-        let repositories: HashSet<Repository> = match make_paginated_github_request(
-            &self.client,
-            &self.token,
-            page_size,
-            &format!("/orgs/{}/repos", &self.org),
-            3,
-            None,
-        ) {
-            Ok(repositories) => repositories,
-            Err(e) => {
-                return Err(format!(
-                    "{}: {}",
-                    "I couldn't fetch the repositories".red(),
-                    e
-                ));
-            }
-        };
-
-        let total = repositories.len();
-        let repositories: HashSet<Repository> = if active_only {
-            repositories
-                .into_iter()
-                .filter(|r| !r.archived && !r.disabled)
-                .collect()
-        } else {
-            repositories
-        };
-
-        println!(
-            "{} {} (active_only = {}, total = {})",
-            "Success! I found: ".green(),
-            repositories.len(),
-            active_only,
-            total
-        );
-        if !repositories
-            .iter()
-            .fold(false, |acc, repo| acc || repo.private)
-        {
-            println!("{}", "I didn't find any private repositories. Make sure you have permission to read private repositories.".red());
-        }
-
-        Ok(repositories)
-    }
-
-    /// Resolve an optional list of repos: if None, fetch all repos from the org.
-    pub fn resolve_repos(&self, repos: Option<Vec<String>>) -> Vec<String> {
-        repos.unwrap_or_else(|| {
-            self.fetch_all_repositories(75, false)
-                .unwrap()
-                .into_iter()
-                .map(|r| r.name)
-                .collect()
-        })
-    }
-}
-
-/// Get collaborators for a given repository
-fn get_repo_collaborators(
-    bootstrap: &Bootstrap,
-    repo: &str,
-) -> Result<HashSet<Collaborator>, String> {
-    make_paginated_github_request(
-        &bootstrap.client,
-        &bootstrap.token,
-        25,
-        &format!("/repos/{}/{}/collaborators", &bootstrap.org, repo),
-        3,
+/// Fetch members of a team, including members of child teams, indexed by login.
+///
+/// This is a free function (rather than a method on [`Team`]) so that callers
+/// that only have a team slug do not need to fabricate a [`Team`] value.
+pub fn fetch_team_members(
+    client: &GitHubClient,
+    slug: &str,
+) -> Result<HashMap<String, Member>, String> {
+    client.get_paginated_indexed(
+        &format!("/orgs/{}/teams/{}/members", client.org(), slug),
+        constants::DEFAULT_PAGE_SIZE,
         None,
     )
-}
-
-/// Get the teams that have access to the repo
-fn get_repo_teams(bootstrap: &Bootstrap, repo: &str) -> Result<HashSet<Team>, String> {
-    make_paginated_github_request(
-        &bootstrap.client,
-        &bootstrap.token,
-        25,
-        &format!("/repos/{}/{}/teams", &bootstrap.org, repo),
-        3,
-        None,
-    )
-}
-
-/// Get the visibility of a repository, given its name
-fn get_repo_visibility(bootstrap: &Bootstrap, repo: &str) -> Result<String, String> {
-    let res = make_github_request(
-        &bootstrap.client,
-        &bootstrap.token,
-        &format!("/repos/{}/{repo}", bootstrap.org),
-        3,
-        None,
-    )?;
-    res.get("visibility")
-        .and_then(|v| v.as_str())
-        .map(|v| v.to_string())
-        .ok_or("Missing visibility in the response from GitHub".to_string())
-}
-
-#[derive(serde::Serialize)]
-pub struct GraphQLQuery {
-    query: String,
-    variables: HashMap<String, String>,
-}
-
-/// Make a GraphQL query on GitHub
-fn make_graphql_query(
-    client: &reqwest::blocking::Client,
-    gh_token: &str,
-    query: GraphQLQuery,
-    retries: u8,
-) -> Result<serde_json::Value, String> {
-    let query = serde_json::to_string(&query).unwrap();
-
-    let content = execute_with_retries(retries, || {
-        client
-            .post(GRAPHQL_URL)
-            .header("User-Agent", "GitHub EC Audit")
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28")
-            .header("Authorization", format!("Bearer {}", gh_token))
-            .body(query.clone())
-            .send()
-            .and_then(|response| response.text())
-    })?;
-
-    serde_json::from_str::<serde_json::Value>(&content)
-        .map_err(|e| format!("Could not deserialize GitHub's response. Error: {e}"))
-}
-
-/// Get the email address associated to a username, if available, through the configured SAML IdP.
-fn email_from_gh_username(bootstrap: &Bootstrap, user: impl Display) -> Option<String> {
-    let q = GraphQLQuery {
-        query: crate::gql_queries::USER2EMAIL.to_string(),
-        variables: [
-            ("org".to_string(), bootstrap.org.clone()),
-            ("user".to_string(), user.to_string()),
-        ]
-        .into(),
-    };
-    make_graphql_query(&bootstrap.client, &bootstrap.token, q, 3)
-        .ok()?
-        .get("data")
-        .and_then(|v| v.get("organization"))
-        .and_then(|v| v.get("samlIdentityProvider"))
-        .and_then(|v| v.get("externalIdentities"))
-        .and_then(|v| v.get("edges"))
-        .and_then(|v| v.as_array())
-        .and_then(|v| v.get(0))
-        .and_then(|v| v.get("node"))
-        .and_then(|v| v.get("samlIdentity"))
-        .and_then(|v| v.get("nameId"))
-        .and_then(|v| v.as_str())
-        .map(|v| v.to_string())
 }
 
 /// Progress tracker for repo-iteration audits
@@ -572,7 +172,7 @@ impl ProgressTracker {
 
     pub fn tick(&mut self) {
         self.progress += 1;
-        if self.progress % self.one_percent == 0 {
+        if self.one_percent > 0 && self.progress.is_multiple_of(self.one_percent) {
             println!(
                 "Processed {} repositories",
                 self.progress.to_string().blue()
@@ -581,12 +181,144 @@ impl ProgressTracker {
     }
 }
 
+/// Escape a value for inclusion in a CSV field.
+///
+/// Values containing a comma, a double quote, a newline or a carriage return
+/// are wrapped in double quotes, with any embedded double quote doubled, as
+/// per RFC 4180. Values that need no escaping are returned unchanged.
+pub fn csv_escape(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
 /// Create a BufWriter to a CSV file, creating parent directories as needed.
 pub fn create_csv_writer(csv_file: &str) -> BufWriter<File> {
     let path = Path::new(csv_file);
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect(&"Could not create folders".red());
+        std::fs::create_dir_all(parent).expect("Could not create folders");
     }
-    let file = File::create(path).expect(&"Could not create CSV file".red());
+    let file = File::create(path).expect("Could not create CSV file");
     BufWriter::new(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn perms(pull: bool, triage: bool, push: bool, maintain: bool, admin: bool) -> Permissions {
+        Permissions {
+            pull,
+            triage,
+            push,
+            maintain,
+            admin,
+        }
+    }
+
+    #[test]
+    fn highest_perm_prefers_admin() {
+        assert_eq!(perms(true, true, true, true, true).highest_perm(), "admin");
+    }
+
+    #[test]
+    fn highest_perm_prefers_maintain_over_push() {
+        assert_eq!(
+            perms(true, true, true, true, false).highest_perm(),
+            "maintain"
+        );
+    }
+
+    #[test]
+    fn highest_perm_prefers_push_over_triage() {
+        assert_eq!(perms(true, true, true, false, false).highest_perm(), "push");
+    }
+
+    #[test]
+    fn highest_perm_prefers_triage_over_pull() {
+        assert_eq!(
+            perms(true, true, false, false, false).highest_perm(),
+            "triage"
+        );
+    }
+
+    #[test]
+    fn highest_perm_is_pull_when_only_pull() {
+        assert_eq!(
+            perms(true, false, false, false, false).highest_perm(),
+            "pull"
+        );
+    }
+
+    #[test]
+    fn highest_perm_is_none_when_no_permission() {
+        assert_eq!(
+            perms(false, false, false, false, false).highest_perm(),
+            "none"
+        );
+    }
+
+    #[test]
+    fn security_property_enabled_only_when_status_is_enabled() {
+        let repo = Repository {
+            name: "r".to_string(),
+            private: false,
+            archived: false,
+            disabled: false,
+            permissions: perms(false, false, false, false, false),
+            visibility: "public".to_string(),
+            security_and_analysis: Some(serde_json::json!({
+                "secret_scanning": { "status": "enabled" },
+                "dependabot_security_updates": { "status": "disabled" }
+            })),
+        };
+        assert!(repo.is_security_property_enabled("secret_scanning"));
+        assert!(!repo.is_security_property_enabled("dependabot_security_updates"));
+        assert!(!repo.is_security_property_enabled("missing"));
+    }
+
+    #[test]
+    fn security_property_is_false_when_analysis_missing() {
+        let repo = Repository {
+            name: "r".to_string(),
+            private: false,
+            archived: false,
+            disabled: false,
+            permissions: perms(false, false, false, false, false),
+            visibility: "public".to_string(),
+            security_and_analysis: None,
+        };
+        assert!(!repo.is_security_property_enabled("secret_scanning"));
+    }
+
+    #[test]
+    fn progress_tracker_does_not_panic_on_empty_input() {
+        // `one_percent` is 0 when total is 0: tick must not divide by zero.
+        let mut tracker = ProgressTracker::new(0);
+        tracker.tick();
+    }
+
+    #[test]
+    fn csv_escape_leaves_plain_values_untouched() {
+        assert_eq!(csv_escape("chainlink"), "chainlink");
+        assert_eq!(csv_escape("admin"), "admin");
+    }
+
+    #[test]
+    fn csv_escape_quotes_values_with_commas() {
+        assert_eq!(csv_escape("a,b"), "\"a,b\"");
+    }
+
+    #[test]
+    fn csv_escape_doubles_embedded_quotes() {
+        assert_eq!(csv_escape("say \"hi\""), "\"say \"\"hi\"\"\"");
+    }
+
+    #[test]
+    fn csv_escape_quotes_values_with_newlines() {
+        assert_eq!(csv_escape("a\nb"), "\"a\nb\"");
+        assert_eq!(csv_escape("a\rb"), "\"a\rb\"");
+    }
 }

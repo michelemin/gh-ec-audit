@@ -2,20 +2,19 @@ use std::collections::{HashMap, HashSet};
 
 use colored::Colorize;
 
-use crate::{
-    get_repo_teams, make_paginated_github_request, make_paginated_github_request_with_index,
-    Bootstrap, Collaborator, Member, ProgressTracker, Team,
-};
+use crate::{fetch_team_members, Collaborator, GitHubClient, Member, ProgressTracker, Team};
 
-pub fn get_org_members(bootstrap: &Bootstrap) -> HashSet<Member> {
-    match make_paginated_github_request(
-        &bootstrap.client,
-        &bootstrap.token,
-        100,
-        &format!("/orgs/{}/members", &bootstrap.org),
-        3,
-        None,
-    ) {
+pub fn get_org_members(client: &GitHubClient) -> HashSet<Member> {
+    match client.org_members(None) {
+        Ok(mem) => mem.into_values().collect(),
+        Err(e) => {
+            panic!("{}: {e}", "I couldn't fetch the organization members".red());
+        }
+    }
+}
+
+pub fn get_indexed_org_members(client: &GitHubClient) -> HashMap<String, Member> {
+    match client.org_members(None) {
         Ok(mem) => mem,
         Err(e) => {
             panic!("{}: {e}", "I couldn't fetch the organization members".red());
@@ -23,50 +22,25 @@ pub fn get_org_members(bootstrap: &Bootstrap) -> HashSet<Member> {
     }
 }
 
-pub fn get_indexed_org_members(bootstrap: &Bootstrap) -> HashMap<String, Member> {
-    match make_paginated_github_request_with_index(
-        &bootstrap.client,
-        &bootstrap.token,
-        100,
-        &format!("/orgs/{}/members", &bootstrap.org),
-        3,
-        None,
-    ) {
-        Ok(mem) => mem,
+pub fn get_org_admins(client: &GitHubClient) -> HashMap<String, Member> {
+    match client.org_members(Some("admin")) {
+        Ok(org_admins) => org_admins,
         Err(e) => {
             panic!("{}: {e}", "I couldn't fetch the organization members".red());
         }
     }
 }
 
-pub fn get_org_admins(bootstrap: &Bootstrap) -> HashMap<String, Member> {
-    let organization_admins: HashMap<String, Member> =
-        match make_paginated_github_request_with_index(
-            &bootstrap.client,
-            &bootstrap.token,
-            100,
-            &format!("/orgs/{}/members", &bootstrap.org),
-            3,
-            Some("role=admin"),
-        ) {
-            Ok(org_admins) => org_admins,
-            Err(e) => {
-                panic!("{}: {e}", "I couldn't fetch the organization members".red());
-            }
-        };
-    organization_admins
-}
-
-pub fn run_audit(bootstrap: Bootstrap) {
-    for member in get_org_members(&bootstrap) {
+pub fn run_audit(client: GitHubClient) {
+    for member in get_org_members(&client) {
         println!("{}", member.avatar_url);
     }
 }
 
-pub fn run_admin_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>) {
-    let organization_admins = get_org_admins(&bootstrap);
+pub fn run_admin_audit(client: GitHubClient, repos: Option<Vec<String>>) {
+    let organization_admins = get_org_admins(&client);
 
-    let repositories = bootstrap.resolve_repos(repos);
+    let repositories = client.resolve_repos(repos);
 
     let mut team_cache: HashMap<String, HashMap<String, Member>> = HashMap::new();
 
@@ -74,7 +48,7 @@ pub fn run_admin_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>) {
 
     for repository in repositories {
         // Get the teams that have access to the repository
-        let repo_teams = match get_repo_teams(&bootstrap, &repository) {
+        let repo_teams = match client.repo_teams(&repository) {
             Ok(rt) => rt,
             Err(_) => {
                 println!(
@@ -105,7 +79,7 @@ pub fn run_admin_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>) {
         for team in &repo_teams {
             if !team_cache.contains_key(&team.slug) {
                 let team_members: HashMap<String, Member> =
-                    match team.fetch_team_members(&bootstrap) {
+                    match fetch_team_members(&client, &team.slug) {
                         Ok(x) => x,
                         Err(e) => {
                             panic!(
@@ -119,14 +93,7 @@ pub fn run_admin_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>) {
             }
         }
 
-        let collaborators: HashSet<Collaborator> = match make_paginated_github_request(
-            &bootstrap.client,
-            &bootstrap.token,
-            25,
-            &format!("/repos/{}/{}/collaborators", &bootstrap.org, repository),
-            3,
-            None,
-        ) {
+        let collaborators: HashSet<Collaborator> = match client.repo_collaborators(&repository) {
             Ok(collaborators) => collaborators,
             Err(e) => {
                 panic!(
@@ -139,20 +106,21 @@ pub fn run_admin_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>) {
 
         for collaborator in collaborators {
             // If this person is a repository admin and not an organization admin
-            if collaborator.permissions.admin
-                && !organization_admins.contains_key(&collaborator.login)
+            if collaborator.permissions().admin
+                && !organization_admins.contains_key(collaborator.login())
             {
                 // Check to see if they are a member of a team that gives them admin access
-                if repo_admin_teams.iter().fold(false, |acc, t| {
-                    acc || team_cache[&t.slug].contains_key(&collaborator.login)
-                }) {
+                if repo_admin_teams
+                    .iter()
+                    .any(|t| team_cache[&t.slug].contains_key(collaborator.login()))
+                {
                     continue;
                 }
 
                 println!(
                     "{} {} {} {}",
                     "I found an admin user:".yellow(),
-                    collaborator.login.white(),
+                    collaborator.login().white(),
                     "on".yellow(),
                     repository.white()
                 );

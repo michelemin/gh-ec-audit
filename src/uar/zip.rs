@@ -29,7 +29,7 @@ pub fn zip_dir_recursive<P: AsRef<Path>>(src_dir: P, zip_path: P) -> std::io::Re
             let zip_path = rel_path.to_string_lossy().replace("\\", "/");
             zip.start_file(zip_path, options)?;
             zip.write_all(&buffer)?;
-        } else if rel_path.as_os_str().len() != 0 {
+        } else if !rel_path.as_os_str().is_empty() {
             // Create directories in the zip if not the root
             let dir_name = rel_path.to_string_lossy().replace("\\", "/") + "/";
             zip.add_directory(dir_name, options)?;

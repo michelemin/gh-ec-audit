@@ -7,10 +7,10 @@ use colored::Colorize;
 
 use crate::{
     codeowners::{iterate::get_co_file, CodeownersFile},
-    email_from_gh_username, get_repo_collaborators, get_repo_teams,
+    csv_escape, fetch_team_members,
     members::get_org_admins,
     teams::get_indexed_org_teams,
-    Bootstrap, Collaborator, Permissions, Team,
+    Collaborator, GitHubClient, Permissions, Team,
 };
 
 /// The folder where we will write output files
@@ -38,17 +38,14 @@ struct UarUsersAndTeams {
 /// to the repo and with which permissions.
 ///
 /// Finally, dump all members of all teams we have encountered.
-pub fn run_uar_audit(bootstrap: Bootstrap, repos: Vec<String>, csv: bool, zip: Option<String>) {
+pub fn run_uar_audit(client: GitHubClient, repos: Vec<String>, csv: bool, zip: Option<String>) {
     println!("{}", "Performing the UAR on the given repos...".yellow());
     let UarPermissions {
         user_repo_permissions,
         team_repo_permissions,
-    } = repos_uar(&bootstrap, &repos, csv).expect(&format!(
-        "{}",
-        "I could not complete the UAR. Giving up.".red()
-    ));
+    } = repos_uar(&client, &repos, csv).expect("I could not complete the UAR. Giving up.");
 
-    teams_uar(&bootstrap, &team_repo_permissions, csv);
+    teams_uar(&client, &team_repo_permissions, csv);
 
     if !csv {
         // Print the mappings for a complete picture
@@ -78,19 +75,16 @@ pub fn run_uar_audit(bootstrap: Bootstrap, repos: Vec<String>, csv: bool, zip: O
 }
 
 /// Gather information about who has access to the repos in scope for the UAR
-fn repos_uar(bootstrap: &Bootstrap, repos: &[String], csv: bool) -> Result<UarPermissions, String> {
+fn repos_uar(client: &GitHubClient, repos: &[String], csv: bool) -> Result<UarPermissions, String> {
     // Mappings to store which repos users and teams have access to
     // { user/team --> (repo, permissions) }
     let mut users_to_repos = HashMap::new();
     let mut teams_to_repos = HashMap::new();
 
     // Get all the members and teams in the org: it will be used for the CO audit
-    let org_teams = get_indexed_org_teams(bootstrap);
+    let org_teams = get_indexed_org_teams(client);
 
-    let org_admins: HashSet<String> = get_org_admins(bootstrap)
-        .iter()
-        .map(|(login, _member)| login.clone())
-        .collect();
+    let org_admins: HashSet<String> = get_org_admins(client).into_keys().collect();
 
     // Prepare vectors where we will collect all the lines to be written to CSV files, if we need to do so
     let mut csv_lines_codeowners = vec![];
@@ -105,7 +99,7 @@ fn repos_uar(bootstrap: &Bootstrap, repos: &[String], csv: bool) -> Result<UarPe
         // If we have a CODEOWNERS file, we focus on that one, otherwise
         // we fall back to looking at the repo's permissions.
         let (uar_users_and_teams, using_codeowners) =
-            if let Ok(Some(co_file)) = get_co_file(&bootstrap, &repo) {
+            if let Ok(Some(co_file)) = get_co_file(client, repo) {
                 // We have a CODEOWNERS file: parse it and collect all users and teams
                 // mentioned in the file, then perform a UAR on those users / teams.
                 println!(
@@ -114,7 +108,7 @@ fn repos_uar(bootstrap: &Bootstrap, repos: &[String], csv: bool) -> Result<UarPe
                     repo.white(),
                     ": using that for the UAR".green()
                 );
-                (co_uar(&bootstrap, &repo, co_file, &org_teams), true)
+                (co_uar(client, repo, co_file, &org_teams), true)
             } else {
                 // No CODEOWNERS file found: proceed with traditional UAR
                 println!(
@@ -123,7 +117,7 @@ fn repos_uar(bootstrap: &Bootstrap, repos: &[String], csv: bool) -> Result<UarPe
                     repo.white(),
                     ": proceeding with traditional UAR".yellow()
                 );
-                (traditional_uar(&bootstrap, &repo, &org_admins), false)
+                (traditional_uar(client, repo, &org_admins), false)
             };
 
         if let Ok(UarUsersAndTeams {
@@ -134,9 +128,9 @@ fn repos_uar(bootstrap: &Bootstrap, repos: &[String], csv: bool) -> Result<UarPe
             // Add everything we found to the mappings
             for u in &collaborators {
                 users_to_repos
-                    .entry(u.login.to_string())
+                    .entry(u.login().to_string())
                     .or_insert_with(HashSet::new)
-                    .insert((repo.clone(), u.permissions.clone()));
+                    .insert((repo.clone(), u.permissions().clone()));
             }
             for t in &teams {
                 teams_to_repos
@@ -151,41 +145,56 @@ fn repos_uar(bootstrap: &Bootstrap, repos: &[String], csv: bool) -> Result<UarPe
                     // Users
                     for u in &collaborators {
                         csv_lines_codeowners.push(format!(
-                            "{repo},{},User,{}",
-                            u.login,
-                            email_from_gh_username(&bootstrap, &u.login)
-                                .unwrap_or("Not available".to_string())
+                            "{},{},User,{}",
+                            csv_escape(repo),
+                            csv_escape(u.login()),
+                            csv_escape(
+                                &client
+                                    .email_from_gh_username(u.login())
+                                    .unwrap_or("Not available".to_string())
+                            )
                         ));
                     }
                     // Teams
                     for t in &teams {
-                        csv_lines_codeowners.push(format!("{repo},{},Team,None", t.slug));
+                        csv_lines_codeowners.push(format!(
+                            "{},{},Team,None",
+                            csv_escape(repo),
+                            csv_escape(&t.slug)
+                        ));
                     }
                 } else {
                     // Write traditional lines
                     // Users
                     for u in &collaborators {
                         csv_lines_traditional.push(format!(
-                            "{repo},{},User,{},{}",
-                            u.login,
-                            email_from_gh_username(&bootstrap, &u.login)
-                                .unwrap_or("Not available".to_string()),
-                            u.permissions.highest_perm()
+                            "{},{},User,{},{}",
+                            csv_escape(repo),
+                            csv_escape(u.login()),
+                            csv_escape(
+                                &client
+                                    .email_from_gh_username(u.login())
+                                    .unwrap_or("Not available".to_string())
+                            ),
+                            csv_escape(&u.permissions().highest_perm())
                         ));
                     }
                     // Teams
                     for t in &teams {
                         csv_lines_traditional.push(format!(
-                            "{repo},{},Team,None,{}",
-                            t.slug,
-                            t.permissions.as_ref().unwrap().highest_perm()
+                            "{},{},Team,None,{}",
+                            csv_escape(repo),
+                            csv_escape(&t.slug),
+                            csv_escape(&t.permissions.as_ref().unwrap().highest_perm())
                         ));
                     }
                 }
             } else {
                 // No CSV: print out the access to this repo
-                let repo_users: Vec<String> =
-                    collaborators.iter().map(|c| c.login.clone()).collect();
+                let repo_users: Vec<String> = collaborators
+                    .iter()
+                    .map(|c| c.login().to_string())
+                    .collect();
                 let repo_teams: Vec<String> = teams.iter().map(|t| t.slug.clone()).collect();
                 println!(
                     "{} {:?} {} {:?}",
@@ -220,18 +229,18 @@ fn repos_uar(bootstrap: &Bootstrap, repos: &[String], csv: bool) -> Result<UarPe
 
 /// Gather information about teams and team membership
 fn teams_uar(
-    bootstrap: &Bootstrap,
+    client: &GitHubClient,
     teams_to_repos: &HashMap<String, HashSet<(String, Option<Permissions>)>>,
     csv: bool,
 ) {
     if csv {
         // Write to CSV the access that teams have
-        csv::team_access_to_csv(format!("{OUTPUT_FOLDER}/teams_access.csv"), &teams_to_repos);
+        csv::team_access_to_csv(format!("{OUTPUT_FOLDER}/teams_access.csv"), teams_to_repos);
         // Write to CSV all the members of the teams
         csv::team_members_to_csv(
-            &bootstrap,
+            client,
             format!("{OUTPUT_FOLDER}/teams_membership.csv"),
-            &teams_to_repos,
+            teams_to_repos,
         );
     } else {
         // Just print to stdout
@@ -257,15 +266,8 @@ fn teams_uar(
         }
 
         println!("\n{}", "TEAMS' MEMBERS".green());
-        for (team, _) in teams_to_repos {
-            // A temporary team object just to be able to call the fetch_members method
-            let tmp_team = Team {
-                id: 0,
-                slug: team.to_string(),
-                name: team.to_string(),
-                permissions: None,
-            };
-            match tmp_team.fetch_team_members(&bootstrap) {
+        for team in teams_to_repos.keys() {
+            match fetch_team_members(client, team) {
                 Ok(m) => {
                     let members: Vec<String> = m.keys().map(|v| v.to_string()).collect();
                     println!("{}:{:?}", team.white(), members);
@@ -285,20 +287,20 @@ fn teams_uar(
 
 /// Extract in-scope collaborators and teams from the given CODEOWNERS file.
 fn co_uar(
-    bootstrap: &Bootstrap,
+    client: &GitHubClient,
     repo: &str,
     co_file: CodeownersFile,
     org_teams: &HashMap<String, Team>,
 ) -> Result<UarUsersAndTeams, String> {
     // Get all users that have access to this repo.
     // Then we will filter and keep only those that appear in the CO file.
-    let users = get_repo_collaborators(bootstrap, repo);
+    let users = client.repo_collaborators(repo);
 
     match users {
         Ok(users) => {
             let filtered_users = users
                 .into_iter()
-                .filter(|u| co_file.users.contains(&u.login))
+                .filter(|u| co_file.users.contains(u.login()))
                 .collect();
             let filtered_teams = org_teams
                 .iter()
@@ -324,19 +326,19 @@ fn co_uar(
 
 /// Extract in-scope collaborators and teams by looking at who has access to the repo.
 fn traditional_uar(
-    bootstrap: &Bootstrap,
+    client: &GitHubClient,
     repo: &str,
     org_admins: &HashSet<String>,
 ) -> Result<UarUsersAndTeams, String> {
-    let users = get_repo_collaborators(bootstrap, repo);
-    let teams = get_repo_teams(bootstrap, repo);
+    let users = client.repo_collaborators(repo);
+    let teams = client.repo_teams(repo);
 
     match (users, teams) {
         (Ok(users), Ok(teams)) => {
             // Filter out the members of org_admins
             let users = users
                 .into_iter()
-                .filter(|c| !org_admins.contains(&c.login))
+                .filter(|c| !org_admins.contains(c.login()))
                 .collect();
             Ok(UarUsersAndTeams {
                 collaborators: users,

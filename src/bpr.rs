@@ -4,7 +4,8 @@ use colored::Colorize;
 use serde::Deserialize;
 
 use crate::actors::{ActorResolver, BypassActor};
-use crate::{make_github_request, make_paginated_github_request, Bootstrap, ProgressTracker};
+use crate::constants::DEFAULT_PAGE_SIZE;
+use crate::{GitHubClient, ProgressTracker};
 
 /// A repository ruleset, as returned by the rulesets endpoint
 #[derive(Debug, Deserialize)]
@@ -67,6 +68,9 @@ struct RepoBypassAudit {
     unparsed_rulesets: Vec<String>,
     /// Whether an active ruleset targeting branches applies to the repository
     has_active_branch_ruleset: bool,
+    /// Whether the branch protection could not be read (e.g. a 403), so the
+    /// BPR findings for this repo are unknown rather than absent
+    bpr_inaccessible: bool,
 }
 
 impl RepoBypassAudit {
@@ -84,16 +88,15 @@ impl RepoBypassAudit {
     fn has_unparsed_rulesets(&self) -> bool {
         !self.unparsed_rulesets.is_empty()
     }
+
+    /// Whether the branch protection could not be read
+    fn has_inaccessible_bpr(&self) -> bool {
+        self.bpr_inaccessible
+    }
 }
 
-fn get_default_branch(bootstrap: &Bootstrap, repo: impl Display) -> String {
-    match make_github_request(
-        &bootstrap.client,
-        &bootstrap.token,
-        &format!("/repos/{}/{repo}", bootstrap.org),
-        3,
-        None,
-    ) {
+fn get_default_branch(client: &GitHubClient, repo: impl Display) -> String {
+    match client.get_json(&format!("/repos/{}/{repo}", client.org()), None) {
         Ok(res) => {
             res.get("default_branch")
                 .unwrap()
@@ -112,29 +115,42 @@ fn get_default_branch(bootstrap: &Bootstrap, repo: impl Display) -> String {
     }
 }
 
+/// The outcome of fetching the traditional branch protection for a branch.
+#[derive(Debug)]
+enum BprFetch {
+    /// Branch protection exists, with the raw response from GitHub
+    Present(serde_json::Value),
+    /// There is no branch protection (GitHub replies with a 404)
+    Absent,
+    /// We could not read the branch protection (e.g. a 403): the findings are
+    /// unknown, not absent, so we must not report them as "no protection"
+    Inaccessible,
+}
+
 /// Fetch the traditional branch protection for the given branch.
-/// Returns `None` if there is no branch protection (GitHub replies with a 404).
-fn get_bpr(
-    bootstrap: &Bootstrap,
-    repo: impl Display,
-    branch: impl Display,
-) -> Option<serde_json::Value> {
-    match make_github_request(
-        &bootstrap.client,
-        &bootstrap.token,
+fn get_bpr(client: &GitHubClient, repo: impl Display, branch: impl Display) -> BprFetch {
+    match client.get_json(
         &format!(
             "/repos/{}/{repo}/branches/{branch}/protection",
-            bootstrap.org
+            client.org()
         ),
-        3,
         None,
     ) {
         Ok(res) => {
             // GitHub replies with a 404-shaped body when no protection exists
             if res.get("status").and_then(|s| s.as_str()) == Some("404") {
-                return None;
+                return BprFetch::Absent;
             }
-            Some(res)
+            // A 403 (or any error body) means we cannot see the protection:
+            // treating it as "present" would make `analyze_bpr` report a bogus
+            // "administrators can bypass" finding, and treating it as "absent"
+            // would wrongly report the repo as unprotected.
+            if res.get("status").and_then(|s| s.as_str()) == Some("403")
+                || res.get("message").is_some()
+            {
+                return BprFetch::Inaccessible;
+            }
+            BprFetch::Present(res)
         }
         Err(e) => {
             panic!(
@@ -149,13 +165,10 @@ fn get_bpr(
 
 /// Fetch all rulesets applying to the given repo, including the ones
 /// configured at the org level. Returns the raw response from GitHub.
-fn get_rulesets_raw(bootstrap: &Bootstrap, repo: impl Display) -> serde_json::Value {
-    match make_paginated_github_request::<serde_json::Value>(
-        &bootstrap.client,
-        &bootstrap.token,
-        100,
-        &format!("/repos/{}/{repo}/rulesets", bootstrap.org),
-        3,
+fn get_rulesets_raw(client: &GitHubClient, repo: impl Display) -> serde_json::Value {
+    match client.get_paginated::<serde_json::Value>(
+        &format!("/repos/{}/{repo}/rulesets", client.org()),
+        DEFAULT_PAGE_SIZE,
         None,
     ) {
         Ok(res) => serde_json::Value::Array(res.into_iter().collect()),
@@ -174,15 +187,12 @@ fn get_rulesets_raw(bootstrap: &Bootstrap, repo: impl Display) -> serde_json::Va
 /// The rulesets *list* endpoint does not populate `bypass_actors`: to see who
 /// can bypass a ruleset, each ruleset must be fetched individually.
 fn get_ruleset_details(
-    bootstrap: &Bootstrap,
+    client: &GitHubClient,
     repo: impl Display,
     ruleset_id: i64,
 ) -> Option<serde_json::Value> {
-    match make_github_request(
-        &bootstrap.client,
-        &bootstrap.token,
-        &format!("/repos/{}/{repo}/rulesets/{ruleset_id}", bootstrap.org),
-        3,
+    match client.get_json(
+        &format!("/repos/{}/{repo}/rulesets/{ruleset_id}", client.org()),
         None,
     ) {
         Ok(res) => {
@@ -294,7 +304,7 @@ fn analyze_bpr(bpr: &serde_json::Value) -> Vec<String> {
 /// all, so they neither protect the repo nor can they be bypassed).
 fn analyze_rulesets(
     resolver: &ActorResolver,
-    bootstrap: &Bootstrap,
+    client: &GitHubClient,
     rulesets: &[Ruleset],
 ) -> (Vec<String>, Vec<String>) {
     let mut bypasses = vec![];
@@ -320,7 +330,7 @@ fn analyze_rulesets(
                 ruleset.name,
                 ruleset.target,
                 ruleset_source(ruleset),
-                resolver.actor_label(bootstrap, actor),
+                resolver.actor_label(client, actor),
                 actor.bypass_mode
             ));
         }
@@ -396,30 +406,41 @@ fn print_recap(results: &[RepoBypassAudit]) {
             );
         }
     }
+
+    let num_inaccessible = results.iter().filter(|r| r.has_inaccessible_bpr()).count();
+    if num_inaccessible > 0 {
+        println!(
+            "{}",
+            "Repos whose branch protection could not be read (403):".yellow()
+        );
+        for result in results.iter().filter(|r| r.has_inaccessible_bpr()) {
+            println!("  - {}", result.name.white());
+        }
+    }
 }
 
 /// Run the branch protection bypass audit on the given repos (or all org repos
 /// if none are passed). When `verbose` is set, also dump the raw BPRs and
 /// rulesets as returned by GitHub.
-pub fn run_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>, verbose: bool) {
+pub fn run_audit(client: GitHubClient, repos: Option<Vec<String>>, verbose: bool) {
     println!("{}", "GitHub Branch Protection Bypass Audit".white().bold());
     println!(
         "{}",
         "Note: rulesets configured at the org level are only listed for tokens with the org-level Administration permission, and bypass actors are only returned for tokens with write access to the ruleset.".yellow()
     );
 
-    let repos = bootstrap.resolve_repos(repos);
+    let repos = client.resolve_repos(repos);
 
     // Resolve actor IDs (teams, users, integrations, custom roles) to names
-    let resolver = ActorResolver::new(&bootstrap);
+    let resolver = ActorResolver::new(&client);
 
     let mut tracker = ProgressTracker::new(repos.len());
     let mut results: Vec<RepoBypassAudit> = vec![];
 
     for repo in &repos {
-        let default_branch = get_default_branch(&bootstrap, repo);
-        let bpr = get_bpr(&bootstrap, repo, &default_branch);
-        let rulesets_raw = get_rulesets_raw(&bootstrap, repo);
+        let default_branch = get_default_branch(&client, repo);
+        let bpr = get_bpr(&client, repo, &default_branch);
+        let rulesets_raw = get_rulesets_raw(&client, repo);
         let (mut rulesets, unparsed_rulesets) = parse_rulesets(&rulesets_raw, repo);
 
         // The list endpoint does not populate bypass_actors: fetch each
@@ -427,7 +448,7 @@ pub fn run_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>, verbose: bool
         // active rulesets: the others are not enforced, so their bypass
         // actors are irrelevant.
         for ruleset in rulesets.iter_mut().filter(|r| r.enforcement == "active") {
-            if let Some(details) = get_ruleset_details(&bootstrap, repo, ruleset.id) {
+            if let Some(details) = get_ruleset_details(&client, repo, ruleset.id) {
                 match serde_json::from_value::<Ruleset>(details) {
                     Ok(detailed) => ruleset.bypass_actors = detailed.bypass_actors,
                     Err(e) => println!(
@@ -446,15 +467,20 @@ pub fn run_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>, verbose: bool
             }
         }
 
-        let (ruleset_bypasses, inactive_rulesets) =
-            analyze_rulesets(&resolver, &bootstrap, &rulesets);
+        let (ruleset_bypasses, inactive_rulesets) = analyze_rulesets(&resolver, &client, &rulesets);
+
+        let (has_bpr, bpr_raw, bpr_bypasses, bpr_inaccessible) = match bpr {
+            BprFetch::Present(raw) => (true, Some(raw.clone()), analyze_bpr(&raw), false),
+            BprFetch::Absent => (false, None, vec![], false),
+            BprFetch::Inaccessible => (false, None, vec![], true),
+        };
 
         results.push(RepoBypassAudit {
             name: repo.clone(),
             default_branch: default_branch.clone(),
-            has_bpr: bpr.is_some(),
-            bpr_raw: bpr.clone(),
-            bpr_bypasses: bpr.as_ref().map(analyze_bpr).unwrap_or_default(),
+            has_bpr,
+            bpr_raw,
+            bpr_bypasses,
             rulesets_raw: rulesets_raw.clone(),
             ruleset_bypasses,
             inactive_rulesets,
@@ -462,6 +488,7 @@ pub fn run_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>, verbose: bool
             has_active_branch_ruleset: rulesets
                 .iter()
                 .any(|r| r.enforcement == "active" && (r.target == "branch" || r.target == "push")),
+            bpr_inaccessible,
         });
 
         tracker.tick();
@@ -476,6 +503,13 @@ pub fn run_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>, verbose: bool
             result.name.white().bold(),
             result.default_branch.white()
         );
+
+        if result.has_inaccessible_bpr() {
+            println!(
+                "   {}",
+                "Branch protection could not be read (403): BPR findings are unknown".yellow()
+            );
+        }
 
         if result.is_unprotected() {
             println!("   {}", "No protection at all on the default branch".red());

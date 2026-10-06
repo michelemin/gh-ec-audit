@@ -3,7 +3,8 @@ use std::{collections::HashSet, io::Write};
 use colored::Colorize;
 use serde::Deserialize;
 
-use crate::{create_csv_writer, get_repo_visibility, make_paginated_github_request, Bootstrap};
+use crate::constants::ALERTS_PAGE_SIZE;
+use crate::{create_csv_writer, csv_escape, GitHubClient};
 
 /// The severity of a security alert
 #[derive(Debug, Deserialize, Eq, PartialEq, Hash)]
@@ -62,7 +63,7 @@ struct AlertCounts {
 
 impl AlertCounts {
     /// Return the total number of alerts
-    fn total(self: &Self) -> i32 {
+    fn total(&self) -> i32 {
         self.low + self.medium + self.high + self.critical
     }
 
@@ -159,15 +160,15 @@ fn number_or_na(num: i32) -> String {
 
 /// Run the audit on the security alerts for the given repos (or all org repos if none are passed).
 /// Optionally, produce a CSV file with the results.
-pub fn run_alerts_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>, csv: bool) {
-    let repos = bootstrap.resolve_repos(repos);
+pub fn run_alerts_audit(client: GitHubClient, repos: Option<Vec<String>>, csv: bool) {
+    let repos = client.resolve_repos(repos);
 
     let repo_alerts = repos
         .iter()
         .map(|repo| RepoAlerts {
             name: repo.to_string(),
-            dependabot: AlertCounts::from(fetch_dependabot_alerts(&bootstrap, &repo)),
-            codescanning: AlertCounts::from(fetch_codescanning_alerts(&bootstrap, &repo)),
+            dependabot: AlertCounts::from(fetch_dependabot_alerts(&client, repo)),
+            codescanning: AlertCounts::from(fetch_codescanning_alerts(&client, repo)),
         })
         .collect::<Vec<_>>();
 
@@ -178,13 +179,17 @@ pub fn run_alerts_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>, csv: b
         let mut writer = create_csv_writer(csv_file);
 
         // Write headers
-        writeln!(writer, "repository, visibility, dependabot alerts, low, medium, high, critical, code scanning alerts, low, medium, high, critical").expect(&"Could not write to CSV file".red());
+        writeln!(writer, "repository,visibility,dependabot_alerts,low,medium,high,critical,code_scanning_alerts,low,medium,high,critical").expect("Could not write to CSV file");
 
         for repo_alert in repo_alerts {
             let line = format!(
-                "{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}",
-                repo_alert.name,
-                get_repo_visibility(&bootstrap, &repo_alert.name).unwrap_or("NA".to_string()),
+                "{},{},{},{},{},{},{},{},{},{},{},{}",
+                csv_escape(&repo_alert.name),
+                csv_escape(
+                    &client
+                        .repo_visibility(&repo_alert.name)
+                        .unwrap_or("NA".to_string())
+                ),
                 number_or_na(repo_alert.dependabot.total()),
                 number_or_na(repo_alert.dependabot.low),
                 number_or_na(repo_alert.dependabot.medium),
@@ -196,7 +201,7 @@ pub fn run_alerts_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>, csv: b
                 number_or_na(repo_alert.codescanning.high),
                 number_or_na(repo_alert.codescanning.critical)
             );
-            writeln!(writer, "{}", line).expect(&"Could not write to CSV file".red());
+            writeln!(writer, "{}", line).expect("Could not write to CSV file");
         }
 
         println!(
@@ -207,21 +212,21 @@ pub fn run_alerts_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>, csv: b
     } else {
         for repo_alert in repo_alerts {
             println!(
-                "{}", format!(
-                    "{} ({})\n\tDependabot: Total {} - Low {} - Medium {} - High {} - Critical {}\n\tCode Scanning: Total {} - Low {} - Medium {} - High {} - Critical {}",
-                    repo_alert.name,
-                    get_repo_visibility(&bootstrap, &repo_alert.name).unwrap_or("NA".to_string()),
-                    number_or_na(repo_alert.dependabot.total()),
-                    number_or_na(repo_alert.dependabot.low),
-                    number_or_na(repo_alert.dependabot.medium),
-                    number_or_na(repo_alert.dependabot.high),
-                    number_or_na(repo_alert.dependabot.critical),
-                    number_or_na(repo_alert.codescanning.total()),
-                    number_or_na(repo_alert.codescanning.low),
-                    number_or_na(repo_alert.codescanning.medium),
-                    number_or_na(repo_alert.codescanning.high),
-                    number_or_na(repo_alert.codescanning.critical)
-                )
+                "{} ({})\n\tDependabot: Total {} - Low {} - Medium {} - High {} - Critical {}\n\tCode Scanning: Total {} - Low {} - Medium {} - High {} - Critical {}",
+                repo_alert.name,
+                client
+                    .repo_visibility(&repo_alert.name)
+                    .unwrap_or("NA".to_string()),
+                number_or_na(repo_alert.dependabot.total()),
+                number_or_na(repo_alert.dependabot.low),
+                number_or_na(repo_alert.dependabot.medium),
+                number_or_na(repo_alert.dependabot.high),
+                number_or_na(repo_alert.dependabot.critical),
+                number_or_na(repo_alert.codescanning.total()),
+                number_or_na(repo_alert.codescanning.low),
+                number_or_na(repo_alert.codescanning.medium),
+                number_or_na(repo_alert.codescanning.high),
+                number_or_na(repo_alert.codescanning.critical)
             )
         }
     }
@@ -229,30 +234,72 @@ pub fn run_alerts_audit(bootstrap: Bootstrap, repos: Option<Vec<String>>, csv: b
 
 /// Fetch all Dependabot alerts for the given repo.
 fn fetch_dependabot_alerts(
-    bootstrap: &Bootstrap,
+    client: &GitHubClient,
     repo: &str,
 ) -> Result<HashSet<DependabotAlert>, String> {
-    make_paginated_github_request(
-        &bootstrap.client,
-        &bootstrap.token,
-        30,
-        &format!("/repos/{}/{repo}/dependabot/alerts", bootstrap.org),
-        3,
-        Some("&state=open"),
+    client.get_paginated(
+        &format!("/repos/{}/{repo}/dependabot/alerts", client.org()),
+        ALERTS_PAGE_SIZE,
+        Some("state=open"),
     )
 }
 
 /// Fetch all CodeQL alerts for the given repo.
 fn fetch_codescanning_alerts(
-    bootstrap: &Bootstrap,
+    client: &GitHubClient,
     repo: &str,
 ) -> Result<HashSet<CodeScanningAlert>, String> {
-    make_paginated_github_request(
-        &bootstrap.client,
-        &bootstrap.token,
-        30,
-        &format!("/repos/{}/{repo}/code-scanning/alerts", bootstrap.org),
-        3,
-        Some("&state=open"),
+    client.get_paginated(
+        &format!("/repos/{}/{repo}/code-scanning/alerts", client.org()),
+        ALERTS_PAGE_SIZE,
+        Some("state=open"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn number_or_na_handles_negative_sentinel() {
+        assert_eq!(number_or_na(-1), "NA");
+        assert_eq!(number_or_na(0), "0");
+        assert_eq!(number_or_na(7), "7");
+    }
+
+    #[test]
+    fn na_counts_total_is_negative() {
+        // The NA sentinel is -1 per bucket; callers must use number_or_na.
+        assert_eq!(AlertCounts::na().total(), -4);
+    }
+
+    #[test]
+    fn counts_from_dependabot_alerts() {
+        let alerts: HashSet<DependabotAlert> = [
+            DependabotAlert {
+                number: 1,
+                security_advisory: DependabotSecurityAdvisory {
+                    severity: Severity::High,
+                },
+            },
+            DependabotAlert {
+                number: 2,
+                security_advisory: DependabotSecurityAdvisory {
+                    severity: Severity::Critical,
+                },
+            },
+        ]
+        .into_iter()
+        .collect();
+        let counts = AlertCounts::from(Ok(alerts));
+        assert_eq!(counts.high, 1);
+        assert_eq!(counts.critical, 1);
+        assert_eq!(counts.total(), 2);
+    }
+
+    #[test]
+    fn counts_from_error_are_na() {
+        let counts = AlertCounts::from(Err::<HashSet<DependabotAlert>, String>("boom".into()));
+        assert_eq!(counts.total(), -4);
+    }
 }

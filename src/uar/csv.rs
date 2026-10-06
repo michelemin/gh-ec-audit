@@ -6,7 +6,7 @@ use std::{
 
 use colored::Colorize;
 
-use crate::{create_csv_writer, email_from_gh_username, Bootstrap, Permissions, Team};
+use crate::{create_csv_writer, fetch_team_members, GitHubClient, Permissions};
 
 /// Write to a CSV file the information we collected during a repo audit
 pub(crate) fn repo_audit_to_csv(csv_file: impl Display, lines: &[String]) {
@@ -16,7 +16,7 @@ pub(crate) fn repo_audit_to_csv(csv_file: impl Display, lines: &[String]) {
     let mut count_entries = 0;
 
     for line in lines {
-        writeln!(writer, "{line}").expect(&"Could not write to CSV file".red());
+        writeln!(writer, "{line}").expect("Could not write to CSV file");
         count_entries += 1;
     }
 
@@ -41,7 +41,7 @@ pub(crate) fn team_access_to_csv(
     let mut writer = create_csv_writer(&csv_file);
 
     // Write headers
-    writeln!(writer, "team,repo,permissions").expect(&"Could not write to CSV file".red());
+    writeln!(writer, "team,repo,permissions").expect("Could not write to CSV file");
 
     let mut count_entries = 0;
 
@@ -54,7 +54,7 @@ pub(crate) fn team_access_to_csv(
                 Some(p) => p.highest_perm(),
                 None => "Codeowner".to_string(),
             };
-            writeln!(writer, "{team},{repo},{}", p).expect(&"Could not write to CSV file".red());
+            writeln!(writer, "{team},{repo},{}", p).expect("Could not write to CSV file");
             count_entries += 1;
         }
     }
@@ -71,7 +71,7 @@ pub(crate) fn team_access_to_csv(
 
 /// Write to a CSV file all the members of the teams we encountered
 pub(crate) fn team_members_to_csv(
-    bootstrap: &Bootstrap,
+    client: &GitHubClient,
     csv_file: impl Display,
     teams_to_repos: &HashMap<String, HashSet<(String, Option<Permissions>)>>,
 ) {
@@ -79,20 +79,12 @@ pub(crate) fn team_members_to_csv(
     let mut writer = create_csv_writer(&csv_file);
 
     // Write headers
-    writeln!(writer, "team,user,email").expect(&"Could not write to CSV file".red());
+    writeln!(writer, "team,user,email").expect("Could not write to CSV file");
 
     let mut count_entries = 0;
 
-    for (team, _) in teams_to_repos {
-        // A temporary team object just to be able to call the fetch_members method
-        let tmp_team = Team {
-            id: 0,
-            slug: team.to_string(),
-            name: team.to_string(),
-            permissions: None,
-        };
-        let members: Vec<String> = tmp_team
-            .fetch_team_members(bootstrap)
+    for team in teams_to_repos.keys() {
+        let members: Vec<String> = fetch_team_members(client, team)
             .unwrap()
             .keys()
             .map(|v| v.to_string())
@@ -102,9 +94,11 @@ pub(crate) fn team_members_to_csv(
             writeln!(
                 writer,
                 "{team},{user},{}",
-                email_from_gh_username(bootstrap, user).unwrap_or("Not available".to_string())
+                client
+                    .email_from_gh_username(user)
+                    .unwrap_or("Not available".to_string())
             )
-            .expect(&"Could not write to CSV file".red());
+            .expect("Could not write to CSV file");
             count_entries += 1;
         }
 

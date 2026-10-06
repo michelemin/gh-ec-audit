@@ -2,7 +2,8 @@ use std::collections::HashSet;
 
 use colored::Colorize;
 
-use crate::{Bootstrap, Repository};
+use crate::constants::REPOS_PAGE_SIZE;
+use crate::{GitHubClient, Repository};
 
 /// Count the number of non-archived repos with given visibility
 /// that have a certain security property set to "enabled"
@@ -42,11 +43,10 @@ fn get_repos_security_property_not_enabled(
 }
 
 /// Run the repos audit
-pub fn run_repos_audit(bootstrap: Bootstrap) {
-    let repos = bootstrap.fetch_all_repositories(75, false).expect(&format!(
-        "{}",
-        "I could not fetch the list of repositories. I am giving up.".red(),
-    ));
+pub fn run_repos_audit(client: GitHubClient) {
+    let repos = client
+        .fetch_all_repositories(REPOS_PAGE_SIZE, false)
+        .expect("I could not fetch the list of repositories. I am giving up.");
 
     // Collect some numbers about the repos and the types
     let num_total = repos.len();
